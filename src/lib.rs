@@ -1,34 +1,37 @@
+mod cache;
 mod shader;
 
+use cache::DescriptorSetCache;
+
 use bytemuck::{Pod, Zeroable};
-use std::convert::TryFrom;
-use vulkano::command_buffer::AutoCommandBufferBuilder;
-use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
-use vulkano::pipeline::graphics::color_blend::ColorBlendState;
-use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
-use vulkano::pipeline::graphics::vertex_input::BuffersDefinition;
-use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::{
     buffer::{BufferUsage, CpuBufferPool},
+    command_buffer::{
+        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
+        AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
+    },
     command_buffer::{PrimaryAutoCommandBuffer, SubpassContents},
+    descriptor_set::{
+        allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet,
+    },
+    device::{Device, Queue},
+    format::Format,
+    image::ImmutableImage,
     image::{view::ImageView, ImageDimensions, ImageViewAbstract},
+    memory::allocator::{MemoryUsage, StandardMemoryAllocator},
+    pipeline::graphics::color_blend::ColorBlendState,
+    pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology},
+    pipeline::graphics::vertex_input::BuffersDefinition,
+    pipeline::graphics::viewport::{Scissor, Viewport, ViewportState},
+    pipeline::{GraphicsPipeline, Pipeline},
     render_pass::RenderPass,
+    render_pass::Subpass,
+    render_pass::{Framebuffer, FramebufferCreateInfo},
+    sampler::{Sampler, SamplerCreateInfo},
+    sync::GpuFuture,
 };
 
-use vulkano::device::{Device, Queue};
-use vulkano::pipeline::{GraphicsPipeline, Pipeline};
-use vulkano::sync::GpuFuture;
-
-use vulkano::image::ImmutableImage;
-use vulkano::sampler::{Sampler, SamplerCreateInfo};
-// use vulkano::sampler::{Sampler, SamplerAddressMode, Filter, MipmapMode};
-use vulkano::format::Format;
-
-use vulkano::render_pass::Subpass;
-use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo};
-
-use std::fmt;
-use std::sync::Arc;
+use std::{convert::TryFrom, fmt, sync::Arc};
 
 use imgui::{internal::RawWrapper, DrawCmd, DrawCmdParams, DrawVert, TextureId, Textures};
 
@@ -72,6 +75,12 @@ impl std::error::Error for RendererError {}
 
 pub type Texture = (Arc<dyn ImageViewAbstract + Send + Sync>, Arc<Sampler>);
 
+pub struct Allocators {
+    pub descriptor_sets: Arc<StandardDescriptorSetAllocator>,
+    pub memory: Arc<StandardMemoryAllocator>,
+    pub command_buffers: Arc<StandardCommandBufferAllocator>,
+}
+
 pub struct Renderer {
     render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
@@ -79,6 +88,10 @@ pub struct Renderer {
     textures: Textures<Texture>,
     vrt_buffer_pool: CpuBufferPool<Vertex>,
     idx_buffer_pool: CpuBufferPool<u16>,
+
+    allocators: Allocators,
+
+    descriptor_set_cache: DescriptorSetCache,
 }
 
 impl Renderer {
@@ -99,7 +112,19 @@ impl Renderer {
         device: Arc<Device>,
         queue: Arc<Queue>,
         format: Format,
+
+        gamma: Option<f32>,
+        allocators: Option<Allocators>,
     ) -> Result<Renderer, Box<dyn std::error::Error>> {
+        let allocators = allocators.unwrap_or_else(|| Allocators {
+            descriptor_sets: Arc::new(StandardDescriptorSetAllocator::new(Arc::clone(&device))),
+            memory: Arc::new(StandardMemoryAllocator::new_default(Arc::clone(&device))),
+            command_buffers: Arc::new(StandardCommandBufferAllocator::new(
+                Arc::clone(&device),
+                StandardCommandBufferAllocatorCreateInfo::default(),
+            )),
+        });
+
         let vs = shader::vs::load(device.clone()).unwrap();
         let fs = shader::fs::load(device.clone()).unwrap();
 
@@ -127,25 +152,48 @@ impl Renderer {
                 InputAssemblyState::new().topology(PrimitiveTopology::TriangleList),
             )
             .viewport_state(ViewportState::viewport_dynamic_scissor_dynamic(1))
-            .fragment_shader(fs.entry_point("main").unwrap(), ())
+            .fragment_shader(
+                fs.entry_point("main").unwrap(),
+                shader::fs::SpecializationConstants {
+                    OUT_GAMMA: gamma.unwrap_or(1.0),
+                },
+            )
             .color_blend_state(ColorBlendState::new(subpass.num_color_attachments()).blend_alpha())
             .render_pass(subpass)
             .build(device.clone())?;
 
         let textures = Textures::new();
 
-        let font_texture =
-            Self::upload_font_texture(&mut ctx.fonts(), device.clone(), queue.clone())?;
+        let font_texture = Self::upload_font_texture(
+            &mut ctx.fonts(),
+            device.clone(),
+            queue.clone(),
+            &allocators,
+        )?;
 
         ctx.set_renderer_name(Some(format!(
             "imgui-vulkano-renderer {}",
             env!("CARGO_PKG_VERSION")
         )));
 
-        let vrt_buffer_pool =
-            CpuBufferPool::new(device.clone(), BufferUsage::vertex_buffer_transfer_dst());
-        let idx_buffer_pool =
-            CpuBufferPool::new(device.clone(), BufferUsage::index_buffer_transfer_dst());
+        let vrt_buffer_pool = CpuBufferPool::new(
+            Arc::clone(&allocators.memory),
+            BufferUsage {
+                vertex_buffer: true,
+                transfer_dst: true,
+                ..BufferUsage::empty()
+            },
+            vulkano::memory::allocator::MemoryUsage::Upload,
+        );
+        let idx_buffer_pool = CpuBufferPool::new(
+            Arc::clone(&allocators.memory),
+            BufferUsage {
+                transfer_dst: true,
+                index_buffer: true,
+                ..BufferUsage::empty()
+            },
+            MemoryUsage::Upload,
+        );
 
         Ok(Renderer {
             render_pass,
@@ -154,6 +202,9 @@ impl Renderer {
             textures,
             vrt_buffer_pool,
             idx_buffer_pool,
+            allocators,
+
+            descriptor_set_cache: DescriptorSetCache::default(),
         })
     }
 
@@ -173,7 +224,6 @@ impl Renderer {
     pub fn draw_commands<I>(
         &mut self,
         cmd_buf_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        _queue: Arc<Queue>,
         target: Arc<I>,
         draw_data: &imgui::DrawData,
     ) -> Result<(), Box<dyn std::error::Error>>
@@ -216,6 +266,10 @@ impl Renderer {
 
         let layout = self.pipeline.layout().set_layouts().get(0).unwrap();
 
+        // Creating a new Framebuffer every frame isn't ideal, but according to this thread,
+        // it also isn't really an issue on desktop GPUs:
+        // https://github.com/GameTechDev/IntroductionToVulkan/issues/20
+        // This might be a good target for optimizations in the future though.
         let framebuffer = Framebuffer::new(
             self.render_pass.clone(),
             FramebufferCreateInfo {
@@ -234,11 +288,11 @@ impl Renderer {
         for draw_list in draw_data.draw_lists() {
             let vertex_buffer = self
                 .vrt_buffer_pool
-                .chunk(draw_list.vtx_buffer().iter().map(|&v| Vertex::from(v)))
+                .from_iter(draw_list.vtx_buffer().iter().map(|&v| Vertex::from(v)))
                 .unwrap();
             let index_buffer = self
                 .idx_buffer_pool
-                .chunk(draw_list.idx_buffer().iter().cloned())
+                .from_iter(draw_list.idx_buffer().iter().cloned())
                 .unwrap();
 
             for cmd in draw_list.commands() {
@@ -249,8 +303,8 @@ impl Renderer {
                             DrawCmdParams {
                                 clip_rect,
                                 texture_id,
-                                // vtx_offset,
                                 idx_offset,
+                                // vtx_offset,
                                 ..
                             },
                     } => {
@@ -266,14 +320,21 @@ impl Renderer {
                             && clip_rect[2] >= 0.0
                             && clip_rect[3] >= 0.0
                         {
-                            let tex = self.lookup_texture(texture_id)?;
-                            let set = PersistentDescriptorSet::new(
-                                layout.clone(),
-                                [WriteDescriptorSet::image_view_sampler(
-                                    0,
-                                    tex.0.clone(),
-                                    tex.1.clone(),
-                                )],
+                            let set = self.descriptor_set_cache.get_or_insert(
+                                texture_id,
+                                |texture_id| {
+                                    let (img, sampler) = Self::lookup_texture(
+                                        &self.textures,
+                                        &self.font_texture,
+                                        texture_id,
+                                    )?
+                                    .clone();
+                                    Ok(PersistentDescriptorSet::new(
+                                        &*self.allocators.descriptor_sets,
+                                        layout.clone(),
+                                        [WriteDescriptorSet::image_view_sampler(0, img, sampler)],
+                                    )?)
+                                },
                             )?;
 
                             cmd_buf_builder
@@ -281,7 +342,7 @@ impl Renderer {
                                     vulkano::pipeline::PipelineBindPoint::Graphics,
                                     self.pipeline.layout().clone(),
                                     0,
-                                    set.clone(),
+                                    set,
                                 )
                                 .set_scissor(
                                     0,
@@ -337,23 +398,40 @@ impl Renderer {
         device: Arc<Device>,
         queue: Arc<Queue>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.font_texture = Self::upload_font_texture(&mut ctx.fonts(), device, queue)?;
+        self.descriptor_set_cache.clear_font_texture();
+        self.font_texture =
+            Self::upload_font_texture(&mut ctx.fonts(), device, queue, &self.allocators)?;
         Ok(())
     }
 
     /// Get the texture library that the renderer uses
-    pub fn textures(&mut self) -> &mut Textures<Texture> {
+    pub fn textures_mut(&mut self) -> &mut Textures<Texture> {
+        // make sure to recreate descriptors if necessary
+        self.descriptor_set_cache.clear();
         &mut self.textures
+    }
+
+    /// Get the texture library that the renderer uses
+    pub fn textures(&self) -> &Textures<Texture> {
+        &self.textures
     }
 
     fn upload_font_texture(
         fonts: &mut imgui::FontAtlas,
         device: Arc<Device>,
         queue: Arc<Queue>,
+        allocators: &Allocators,
     ) -> Result<Texture, Box<dyn std::error::Error>> {
         let texture = fonts.build_rgba32_texture();
 
-        let (image, fut) = ImmutableImage::from_iter(
+        let mut builder = AutoCommandBufferBuilder::primary(
+            &*allocators.command_buffers,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )?;
+
+        let image = ImmutableImage::from_iter(
+            &*allocators.memory,
             texture.data.iter().cloned(),
             ImageDimensions::Dim2d {
                 width: texture.width,
@@ -362,10 +440,15 @@ impl Renderer {
             },
             vulkano::image::MipmapsCount::One,
             Format::R8G8B8A8_SRGB,
-            queue.clone(),
+            &mut builder,
         )?;
 
-        fut.then_signal_fence_and_flush()?.wait(None)?;
+        let command_buffer = builder.build()?;
+
+        command_buffer
+            .execute(queue)?
+            .then_signal_fence_and_flush()?
+            .wait(None)?;
 
         let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear())?;
 
@@ -373,10 +456,14 @@ impl Renderer {
         Ok((ImageView::new_default(image)?, sampler))
     }
 
-    fn lookup_texture(&self, texture_id: TextureId) -> Result<&Texture, RendererError> {
+    fn lookup_texture<'a>(
+        textures: &'a Textures<Texture>,
+        font_texture: &'a Texture,
+        texture_id: TextureId,
+    ) -> Result<&'a Texture, RendererError> {
         if texture_id.id() == usize::MAX {
-            Ok(&self.font_texture)
-        } else if let Some(texture) = self.textures.get(texture_id) {
+            Ok(&font_texture)
+        } else if let Some(texture) = textures.get(texture_id) {
             Ok(texture)
         } else {
             Err(RendererError::BadTexture(texture_id))
